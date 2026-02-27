@@ -1,6 +1,6 @@
 import os
 import json
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -68,8 +68,18 @@ def convert(req: ConvertRequest):
             raise HTTPException(status_code=400, detail="For multiple inputs, output_gs must end with '/'")
 
         _set_converter_config(req)
-        conv.main()
-        return {"ok": True}
+
+        result: Dict[str, Any] = conv.main()  # ★ main() の return を受け取る
+
+        # ★ APIレスポンスに images を含める
+        return {
+            "ok": True,
+            "ai_case_id": result.get("ai_case_id"),
+            "img_urls_count": result.get("img_urls_count"),
+            "images": result.get("images", []),
+            "mysql_update": result.get("mysql_update"),
+        }
+
     except HTTPException:
         raise
     except Exception as e:

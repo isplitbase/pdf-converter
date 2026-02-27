@@ -4,7 +4,7 @@ import json
 import subprocess
 import tempfile
 import socket
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 from google.cloud import storage
 from pdf2image import convert_from_path
@@ -240,12 +240,7 @@ def mysql_connect(database: Optional[str]):
 
 
 def detect_db_with_ai_case(conn) -> Optional[str]:
-    """ai_case テーブルが存在するDBを自動検出する。
-
-    優先:
-      1) information_schema.tables を参照（権限があれば最速）
-      2) 権限がない場合は SHOW DATABASES + 試行で探索（権限の範囲で見えるDBのみ）
-    """
+    """ai_case テーブルが存在するDBを自動検出する。"""
     # 1) information_schema
     try:
         with conn.cursor() as cur:
@@ -262,12 +257,10 @@ def detect_db_with_ai_case(conn) -> Optional[str]:
             return schemas[0]
         if len(schemas) > 1:
             raise RuntimeError(f"MYSQL_DB is empty and ai_case exists in multiple schemas: {schemas}")
-        # 0件なら次へ
     except Exception:
-        # information_schema にアクセスできない/失敗したらフォールバックへ
         pass
 
-    # 2) fallback: 見えているDBを列挙して ai_case の存在を試行
+    # 2) fallback
     found = []
     with conn.cursor() as cur:
         cur.execute("SHOW DATABASES")
@@ -324,7 +317,6 @@ def mysql_update_ai_case_img_urls(ai_case_id: str, img_urls_joined: str) -> Tupl
         return False, f"update_failed: {e}"
 
 
-
 # =============================
 # MySQL connectivity check (追加)
 # =============================
@@ -377,7 +369,7 @@ def mysql_probe(
 # =============================
 # Main (Job entrypoint)
 # =============================
-def main() -> None:
+def main() -> Dict[str, Any]:
     upload_file_keys = parse_upload_file_keys(UPLOAD_FILE_KEYS_RAW)
 
     # 追加: MySQL疎通チェック（最初に実施）
@@ -427,7 +419,7 @@ def main() -> None:
         "stage": "start",
         "code_version": CODE_VERSION,
         "inputs": inputs,
-        "upload_file_keys": upload_file_keys,   # 将来利用のためログ出し
+        "upload_file_keys": upload_file_keys,
         "output_gs": OUTPUT_GS or "(auto)",
         "target": [TARGET_W, TARGET_H],
         "use_cropbox": USE_CROPBOX,
@@ -499,15 +491,18 @@ def main() -> None:
 
     upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
 
-    log_json({
+    result = {
         "ok": True,
         "stage": "done",
         "ai_case_id": ai_case_id,
         "img_urls_delimiter": "|,|",
         "img_urls_count": len(all_uploaded_images),
         "mysql_update": {"ok": upd_ok, "message": upd_msg},
-        "images": all_uploaded_images
-    })
+        "images": all_uploaded_images,
+    }
+
+    log_json(result)
+    return result
 
 
 if __name__ == "__main__":
