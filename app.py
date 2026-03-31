@@ -48,12 +48,12 @@ def _set_converter_config(req: ConvertRequest) -> None:
     conv.MYSQL_CHECK = bool(req.mysql_check)
     conv.MYSQL_HOST = str(req.mysql_host).strip() or "10.146.0.2"
     conv.MYSQL_PORT = int(req.mysql_port) if req.mysql_port else 3306
-    _port_user_map = {
+    conv.MYSQL_USER = "IsplitAdmin"
+    _port_db_map = {
         8056: "dbtest1",
         8012: "dbwindow",
     }
-    conv.MYSQL_USER = _port_user_map.get(int(req.port), "IsplitAdmin")
-    conv.MYSQL_DB = str(req.mysql_db).strip()
+    conv.MYSQL_DB = _port_db_map.get(int(req.port), str(req.mysql_db).strip())
     conv.MYSQL_CONNECT_TIMEOUT = int(req.mysql_connect_timeout)
 
     conv.MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
