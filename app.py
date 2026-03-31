@@ -24,11 +24,14 @@ class ConvertRequest(BaseModel):
     mysql_check: bool = True
     mysql_host: str = "10.146.0.2"
     mysql_port: int = 3306
-    mysql_user: str = ""
+    mysql_user: str = "IsplitAdmin"
     mysql_db: str = "dbtest1"
     mysql_connect_timeout: int = 3
 
     upload_file_keys: Optional[str] = ""
+
+    ai_case_id: Optional[str] = Field(None, description="AI Case ID for progress callbacks")
+    port: int = Field(8056, description="Analygent server port for progress callbacks")
 
 
 def _set_converter_config(req: ConvertRequest) -> None:
@@ -43,14 +46,21 @@ def _set_converter_config(req: ConvertRequest) -> None:
     conv.NUMBER_FORMAT = str(req.number_format)
 
     conv.MYSQL_CHECK = bool(req.mysql_check)
-    conv.MYSQL_HOST = str(req.mysql_host).strip()
-    conv.MYSQL_PORT = int(req.mysql_port)
-    conv.MYSQL_USER = str(req.mysql_user).strip()
+    conv.MYSQL_HOST = str(req.mysql_host).strip() or "10.146.0.2"
+    conv.MYSQL_PORT = int(req.mysql_port) if req.mysql_port else 3306
+    _port_user_map = {
+        8056: "dbtest1",
+        8012: "dbwindow",
+    }
+    conv.MYSQL_USER = _port_user_map.get(int(req.port), "IsplitAdmin")
     conv.MYSQL_DB = str(req.mysql_db).strip()
     conv.MYSQL_CONNECT_TIMEOUT = int(req.mysql_connect_timeout)
 
     conv.MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
     conv.UPLOAD_FILE_KEYS_RAW = (req.upload_file_keys or "").strip()
+
+    conv.AI_CASE_ID = str(req.ai_case_id or "").strip()
+    conv.ANALYGENT_PORT = int(req.port)
 
 
 @app.get("/healthz")
@@ -66,6 +76,10 @@ def convert(req: ConvertRequest):
             raise HTTPException(status_code=400, detail="input_gs is required")
         if len(req.input_gs) > 1 and req.output_gs and not req.output_gs.endswith("/"):
             raise HTTPException(status_code=400, detail="For multiple inputs, output_gs must end with '/'")
+
+        ai_case_id_str = str(req.ai_case_id or "").strip()
+        if not ai_case_id_str or not ai_case_id_str.isdigit():
+            raise HTTPException(status_code=400, detail="ai_case_id is required and must be numeric")
 
         _set_converter_config(req)
 

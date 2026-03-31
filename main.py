@@ -4,6 +4,8 @@ import json
 import subprocess
 import tempfile
 import socket
+import urllib.request
+import urllib.parse
 from typing import List, Tuple, Optional, Dict, Any
 
 from google.cloud import storage
@@ -33,12 +35,15 @@ NUMBER_FORMAT = os.environ.get("NUMBER_FORMAT", "03d")
 MYSQL_CHECK = os.environ.get("MYSQL_CHECK", "true").lower() in ("1", "true", "yes", "y")
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "10.146.0.2").strip()
 MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
-MYSQL_USER = os.environ.get("MYSQL_USER", "").strip()
+MYSQL_USER = os.environ.get("MYSQL_USER", "IsplitAdmin").strip()
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 MYSQL_DB = os.environ.get("MYSQL_DB", "").strip()
 MYSQL_CONNECT_TIMEOUT = int(os.environ.get("MYSQL_CONNECT_TIMEOUT", "3"))
 
 UPLOAD_FILE_KEYS_RAW = os.environ.get("UPLOAD_FILE_KEYS", "").strip()
+
+AI_CASE_ID = os.environ.get("AI_CASE_ID", "").strip()
+ANALYGENT_PORT = int(os.environ.get("ANALYGENT_PORT", "8056"))
 
 # デプロイ確認用（ログに出す）
 CODE_VERSION = "2026-01-30-main-patched-v2"
@@ -175,6 +180,27 @@ def resolve_output_target(
 def log_json(payload: dict) -> None:
     # Cloud Run Jobs ではログ遅延/欠落を避けるため flush する
     print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def post_progress(message: str) -> None:
+    """進捗メッセージを analygent サーバへ POST する（失敗しても処理は継続）"""
+    global AI_CASE_ID, ANALYGENT_PORT  # app.py から conv.ANALYGENT_PORT = req.port でセットされる
+    if not AI_CASE_ID:
+        return
+    url = f"https://corp.analygent.com:{ANALYGENT_PORT}/sapis/set_upload_files_status_bvvu0xwac2afl7ubhkqj.php"
+    content = json.dumps({"message": message}, ensure_ascii=False)
+    data = urllib.parse.urlencode({
+        "pqlxf4xct4jdsphk8kgc": "uptprogress",
+        "ai_case_id": AI_CASE_ID,
+        "f1htbrtxki4x7s4s0xqj": content,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        log_json({"ok": True, "stage": "post_progress", "message": message})
+    except Exception as e:
+        log_json({"ok": False, "stage": "post_progress_error", "message": message, "error": str(e)})
 
 
 # =============================
@@ -429,7 +455,9 @@ def main() -> Dict[str, Any]:
         "mysql_db": MYSQL_DB or "(auto-detect)"
     })
 
-    for one_input in inputs:
+    for idx_input, one_input in enumerate(inputs, start=1):
+        post_progress(f"{idx_input}番目PDFを画像に変換中")
+
         in_bucket, in_obj = parse_gs_uri(one_input)
         out_bucket, out_prefix = resolve_output_target(in_bucket, in_obj, OUTPUT_GS)
 
@@ -490,6 +518,8 @@ def main() -> Dict[str, Any]:
     img_urls_joined = "|,|".join(all_uploaded_images)
 
     upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
+
+    post_progress("読取完了まで")
 
     result = {
         "ok": True,
