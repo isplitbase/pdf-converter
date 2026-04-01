@@ -200,11 +200,11 @@ def post_progress(message: str) -> None:
             req = urllib.request.Request(url, data=data)
             with urllib.request.urlopen(req, timeout=10):
                 pass
-            log_json({"ok": True, "stage": "post_progress", "message": message, "attempt": attempt})
+            log_json({"ok": True, "stage": "post_progress", "message": message, "url": url, "attempt": attempt})
             return
         except Exception as e:
-            log_json({"ok": False, "stage": "post_progress_error", "message": message, "attempt": attempt, "error": str(e)})
-    log_json({"ok": False, "stage": "post_progress_give_up", "message": message})
+            log_json({"ok": False, "stage": "post_progress_error", "message": message, "url": url, "attempt": attempt, "error": str(e)})
+    log_json({"ok": False, "stage": "post_progress_give_up", "message": message, "url": url})
 
 
 # =============================
