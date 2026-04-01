@@ -33,6 +33,9 @@ class ConvertRequest(BaseModel):
     ai_case_id: Optional[str] = Field(None, description="AI Case ID for progress callbacks")
     port: int = Field(8056, description="Analygent server port for progress callbacks")
 
+    read_sga: bool = Field(False, description="販売費及び一般管理費ページを識別するか")
+    read_mcr: bool = Field(False, description="製造原価報告書ページを識別するか")
+
 
 def _set_converter_config(req: ConvertRequest) -> None:
     conv.INPUT_GS = json.dumps(req.input_gs, ensure_ascii=False)
@@ -61,6 +64,8 @@ def _set_converter_config(req: ConvertRequest) -> None:
 
     conv.AI_CASE_ID = str(req.ai_case_id or "").strip()
     conv.ANALYGENT_PORT = int(req.port)
+    conv.READ_SGA = bool(req.read_sga)
+    conv.READ_MCR = bool(req.read_mcr)
 
 
 @app.get("/healthz")

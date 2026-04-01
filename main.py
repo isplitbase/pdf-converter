@@ -6,6 +6,7 @@ import tempfile
 import socket
 import urllib.request
 import urllib.parse
+import unicodedata
 from typing import List, Tuple, Optional, Dict, Any
 
 from google.cloud import storage
@@ -44,6 +45,14 @@ UPLOAD_FILE_KEYS_RAW = os.environ.get("UPLOAD_FILE_KEYS", "").strip()
 
 AI_CASE_ID = os.environ.get("AI_CASE_ID", "").strip()
 ANALYGENT_PORT = int(os.environ.get("ANALYGENT_PORT", "8056"))
+
+# Azure OCR
+AZURE_KEY = os.environ.get("AZURE_KEY", "").strip()
+AZURE_ENDPOINT = os.environ.get("AZURE_ENDPOINT", "").strip()
+
+# ページ分類オプション（リクエスト経由でセット）
+READ_SGA = os.environ.get("READ_SGA", "false").lower() in ("1", "true", "yes", "y")
+READ_MCR = os.environ.get("READ_MCR", "false").lower() in ("1", "true", "yes", "y")
 
 # デプロイ確認用（ログに出す）
 CODE_VERSION = "2026-01-30-main-patched-v2"
@@ -398,6 +407,332 @@ def mysql_probe(
 
 
 # =============================
+# Azure OCR
+# =============================
+def call_azure_ocr(image_path: str) -> Dict[str, Any]:
+    """
+    Azure Computer Vision OCR API (v3.2) を呼び出す。
+    返り値: {"text_annotations": [{"description": "全テキスト"}]}
+    """
+    global AZURE_KEY, AZURE_ENDPOINT
+    if not AZURE_KEY or not AZURE_ENDPOINT:
+        raise RuntimeError("AZURE_KEY または AZURE_ENDPOINT が未設定です")
+
+    endpoint = AZURE_ENDPOINT.rstrip("/")
+    url = f"{endpoint}/vision/v3.2/ocr?language=ja&detectOrientation=true"
+
+    with open(image_path, "rb") as f:
+        image_data = f.read()
+
+    req = urllib.request.Request(
+        url,
+        data=image_data,
+        headers={
+            "Ocp-Apim-Subscription-Key": AZURE_KEY,
+            "Content-Type": "application/octet-stream",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    # Azure OCR レスポンス → PHP azure_ai.py 互換形式に変換
+    lines_text = []
+    for region in data.get("regions", []):
+        for line in region.get("lines", []):
+            words = " ".join(w.get("text", "") for w in line.get("words", []))
+            lines_text.append(words)
+    all_text = "\n".join(lines_text)
+    return {"text_annotations": [{"description": all_text}]}
+
+
+# =============================
+# Page Classification  (upload_files_sub_8dj4.php 移植)
+# =============================
+def _normalize_classify(text: str) -> str:
+    """全角/半角統一 + 空白除去 + 小文字化 + OCR揺らぎ補正（PHP $__normalize 移植）"""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = re.sub(r"\s+", "", text)  # 改行・タブ含む全空白除去
+    # OCR 誤認識・旧字体の補正（PHP strtr と同等）
+    _ocr_fix = {
+        "販賣": "販売",
+        "賣":   "売",
+        "價":   "価",
+        "及ヒ": "及び",
+        "販売費及一般管理費": "販売費及び一般管理費",
+    }
+    for old, new in _ocr_fix.items():
+        text = text.replace(old, new)
+    return text.lower()
+
+
+def _is_keyword_match(text: str, keyword: str, threshold: float = 1.0) -> bool:
+    """PHP isKeywordMatch() の Python 移植（文字単位の順次マッチング）"""
+    text = _normalize_classify(text)
+    keyword = _normalize_classify(keyword)
+    if not keyword:
+        return True
+    keyword_chars = list(keyword)
+    text_chars = list(text)
+    match_count = 0
+    text_index = 0
+    for char in keyword_chars:
+        found = False
+        while text_index < len(text_chars):
+            if text_chars[text_index] == char:
+                match_count += 1
+                text_index += 1
+                found = True
+                break
+            text_index += 1
+        if not found:
+            break
+    return (match_count / len(keyword_chars)) >= threshold
+
+
+def _contains_keyword_with_match(text: str, keywords: List[str]) -> Tuple[bool, Optional[str]]:
+    for kw in keywords:
+        if _is_keyword_match(text, kw):
+            return True, kw
+    return False, None
+
+
+def _is_capital_change_like(
+    text: str, keywords: List[str], threshold: float = 0.70
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    lines = re.split(r"\r\n|\n|\r", text or "")
+    for line in lines:
+        normalized_line = _normalize_classify(line)
+        for kw in keywords:
+            if _is_keyword_match(normalized_line, kw, threshold):
+                return True, kw, line
+    return False, None, None
+
+
+def _classify_page(text: str) -> Dict[str, Any]:
+    """PHP classifyPage() の Python 移植"""
+    bs_keywords = [
+        "流動資産", "現金及び預金", "売掛金", "繰延資産", "資産の部",
+        "流動負債", "買掛金", "短期借入金", "預り金", "固定負債", "負債の部",
+        "純資産の部", "株主資本", "資本金", "資本剰余金", "利益剰余金",
+        "その他利益剰余金", "評価換算差額等", "新株予約権", "純資産の部合計",
+        "純資産合計", "負債純資産の部合計",
+    ]
+    pl_keywords = [
+        "売上高", "売上原価", "期首棚卸高", "仕入高", "期末棚卸高", "売上総利益",
+        "営業利益", "営業損失", "営業外収益", "受取利息", "受取配当金", "営業外費用",
+        "支払利息", "特別利益", "特別損失", "税引前当期利益", "税引前当期損失",
+        "法人税住民税及び事業税", "当期純利益", "当期純損失", "その他収益",
+        "当期収益", "当期損失",
+    ]
+    cf_keywords = [
+        "資本等変動計算書", "株主資本等変動計算書", "連結株主資本等変動計算書",
+        "連結持分変動計算書", "一般管理費の計算内訳", "一般管理費計算内訳",
+        "管理費の計算内訳", "管理費計算内訳", "棚卸資産の計算内訳", "棚卸資産計算内訳",
+    ]
+
+    cf_hit, cf_kw, cf_line = _is_capital_change_like(text, cf_keywords, 0.70)
+    if cf_hit:
+        return {
+            "type": "対象外",
+            "firstHalfMatch": [],
+            "secondHalfMatch": [],
+            "cfKeywords": "NG",
+            "cfMatchedKeyword": cf_kw,
+            "cfMatchedLine": cf_line,
+        }
+
+    lines = re.split(r"\r\n|\n|\r", text or "")
+    half = -(-len(lines) // 2)  # ceil
+    first_half = "\n".join(lines[:half])
+    second_half = "\n".join(lines[half:])
+
+    match_info: Dict[str, Any] = {"type": "", "firstHalfMatch": [], "secondHalfMatch": []}
+    first_bs, m_fbs = _contains_keyword_with_match(first_half, bs_keywords)
+    first_pl, m_fpl = _contains_keyword_with_match(first_half, pl_keywords)
+    second_bs, m_sbs = _contains_keyword_with_match(second_half, bs_keywords)
+    second_pl, m_spl = _contains_keyword_with_match(second_half, pl_keywords)
+
+    if first_bs and m_fbs:
+        match_info["firstHalfMatch"].append(m_fbs)
+    if first_pl and m_fpl:
+        match_info["firstHalfMatch"].append(m_fpl)
+    if second_bs and m_sbs:
+        match_info["secondHalfMatch"].append(m_sbs)
+    if second_pl and m_spl:
+        match_info["secondHalfMatch"].append(m_spl)
+
+    if first_bs and second_pl:
+        match_info["type"] = "BS=>PL"
+    elif first_pl and second_bs:
+        match_info["type"] = "PL=>BS"
+    elif first_bs or second_bs:
+        match_info["type"] = "BS"
+    elif first_pl or second_pl:
+        match_info["type"] = "PL"
+    else:
+        match_info["type"] = "対象外"
+
+    return match_info
+
+
+def _apply_extended_classification(
+    print_images: List[Dict],
+    image_txt: List[Dict],
+    read_sga: bool,
+    read_mcr: bool,
+) -> None:
+    """PHP の read_sga/read_mcr 拡張分類ブロックの Python 移植"""
+    if not (read_sga or read_mcr):
+        return
+
+    mfg_titles = ["製造原価報告書", "製造原価の報告書"]
+    mfg_required = [
+        "当期製造原価", "当期総製造費用", "期首仕掛品", "期末仕掛品",
+        "仕掛品", "材料費", "労務費", "製造間接費", "製造原価",
+        "加工費", "製造部門", "月別製造原価",
+    ]
+    neg_strong = ["貸借対照表", "balance sheet", "balancesheet", "資産の部", "負債の部", "純資産の部"]
+
+    for i, info in enumerate(print_images):
+        cur_type = info["page_type"]["type"]
+        raw_text = ""
+        if i < len(image_txt):
+            ocr = image_txt[i]
+            if isinstance(ocr, dict) and ocr.get("text_annotations"):
+                raw_text = ocr["text_annotations"][0].get("description", "")
+
+        t = _normalize_classify(raw_text)
+        if not t:
+            # PHP 準拠: cur_type に関わらず「不明」をセットして次へ
+            info["page_type"]["type"] = "不明"
+            continue
+
+        # 1) 販売費及び一般管理費
+        has_han = _is_keyword_match(t, _normalize_classify("販売費"), 0.86)
+        has_ipp = (
+            _is_keyword_match(t, _normalize_classify("一般管理"), 0.86)
+            or _is_keyword_match(t, _normalize_classify("一般管理費"), 0.86)
+        )
+        if has_han and has_ipp:
+            if read_sga and cur_type != "BS or PL":
+                info["page_type"]["type"] = "販売費"
+            continue
+
+        # 2-1) 製造原価報告書タイトル一致
+        mfg_title_hit = any(
+            _is_keyword_match(t, _normalize_classify(ttl), 0.86) for ttl in mfg_titles
+        )
+        if mfg_title_hit:
+            if read_mcr:
+                info["page_type"]["type"] = "製造原価"
+            continue
+
+        # 2-2) 必須キーワード3語以上 + 強否定なし
+        hits = sum(1 for kw in mfg_required if _is_keyword_match(t, _normalize_classify(kw), 0.85))
+        has_neg = any(_is_keyword_match(t, _normalize_classify(ng), 0.90) for ng in neg_strong)
+        if hits >= 3 and not has_neg:
+            if read_mcr:
+                info["page_type"]["type"] = "製造原価"
+            continue
+
+        if cur_type == "BS or PL":
+            continue
+        info["page_type"]["type"] = "対象外"
+
+
+# =============================
+# MySQL full update helpers
+# =============================
+def mysql_fetch_ai_case_data(ai_case_id: str) -> Dict[str, Any]:
+    """ai_case から request (dict), upload_file_name (str) を取得"""
+    if pymysql is None or not MYSQL_DB:
+        return {"request": {}, "upload_file_name": ""}
+    try:
+        conn = mysql_connect(MYSQL_DB)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT request, upload_file_name FROM `{MYSQL_DB}`.`ai_case` WHERE ai_case_id=%s",
+                    (ai_case_id,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            req = {}
+            try:
+                req = json.loads(row[0]) if row[0] else {}
+            except Exception:
+                req = {}
+            return {"request": req, "upload_file_name": row[1] or ""}
+        return {"request": {}, "upload_file_name": ""}
+    except Exception as e:
+        log_json({"ok": False, "stage": "mysql_fetch_ai_case_data_error", "error": str(e)})
+        return {"request": {}, "upload_file_name": ""}
+
+
+def mysql_fetch_page_types() -> List[Dict]:
+    """page_types テーブルを取得"""
+    if pymysql is None or not MYSQL_DB:
+        return []
+    try:
+        conn = mysql_connect(MYSQL_DB)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT page_type_id, type FROM `{MYSQL_DB}`.`page_types`")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [{"page_type_id": r[0], "type": r[1]} for r in (rows or [])]
+    except Exception as e:
+        log_json({"ok": False, "stage": "mysql_fetch_page_types_error", "error": str(e)})
+        return []
+
+
+def mysql_update_ai_case_full(
+    ai_case_id: str,
+    request_json: str,
+    sizes_str: str,
+    status: str = "IMED",
+) -> Tuple[bool, str]:
+    """ai_case の update_at, request, sizes, status を一括更新"""
+    if not MYSQL_USER:
+        return False, "skip_update: MYSQL_USER is empty"
+    if pymysql is None:
+        return False, "pymysql_not_installed"
+    try:
+        db = MYSQL_DB
+        if not db:
+            conn0 = mysql_connect(None)
+            try:
+                db = detect_db_with_ai_case(conn0)
+            finally:
+                conn0.close()
+            if not db:
+                return False, "skip_update: MYSQL_DB is empty and ai_case table not found"
+
+        conn = mysql_connect(db)
+        try:
+            with conn.cursor() as cur:
+                sql = f"""
+                    UPDATE `{db}`.`ai_case`
+                    SET update_at=NOW(),
+                        request=%s,
+                        sizes=%s,
+                        status=%s
+                    WHERE ai_case_id=%s
+                """
+                cur.execute(sql, (request_json, sizes_str, status, ai_case_id))
+                affected = cur.rowcount
+        finally:
+            conn.close()
+        return True, f"updated: db={db}, affected_rows={affected}"
+    except Exception as e:
+        return False, f"update_failed: {e}"
+
+
+# =============================
 # Main (Job entrypoint)
 # =============================
 def main() -> Dict[str, Any]:
@@ -444,6 +779,11 @@ def main() -> Dict[str, Any]:
         raise ValueError(f"入力ファイルの ai_case_id が一致しません: {ai_case_ids}")
 
     all_uploaded_images: List[str] = []
+    all_ocr_results: List[Dict] = []          # Azure OCR 結果（ページ順）
+    all_image_sizes: List[str] = []           # "widthxheight"（ページ順）
+    all_page_upload_keys: List[str] = []      # upload_file_key（ページ順）
+    all_pdf_names: List[str] = []             # PDF ファイル名（ページ順）
+    img_cont = 1                              # 進捗カウンタ
 
     log_json({
         "ok": True,
@@ -498,8 +838,15 @@ def main() -> Dict[str, Any]:
                 threads=THREAD_COUNT
             )
 
-            # 4) upload to GCS
+            # 4) upload to GCS + Azure OCR + image size
             uploaded = []
+            ufkey = (
+                upload_file_keys[idx_input - 1]
+                if idx_input - 1 < len(upload_file_keys)
+                else f"file{idx_input}"
+            )
+            pdf_basename = in_obj.rsplit("/", 1)[-1]
+
             for i, path in enumerate(png_paths, start=1):
                 idx = format_index(i)
                 out_obj = f"{out_prefix}{idx}.png"
@@ -509,6 +856,30 @@ def main() -> Dict[str, Any]:
                 )
                 uploaded.append(f"gs://{out_bucket}/{out_obj}")
 
+                # 画像サイズ取得
+                try:
+                    from PIL import Image as _PilImage
+                    with _PilImage.open(path) as pil_img:
+                        w_px, h_px = pil_img.size
+                    all_image_sizes.append(f"{w_px}x{h_px}")
+                except Exception as size_err:
+                    log_json({"ok": False, "stage": "image_size_error", "path": path, "error": str(size_err)})
+                    all_image_sizes.append("unknown")
+
+                # Azure OCR
+                post_progress(f"{img_cont}番目画像の帳票種類識別中")
+                img_cont += 1
+                try:
+                    ocr_result = call_azure_ocr(path)
+                    all_ocr_results.append(ocr_result)
+                    log_json({"ok": True, "stage": "azure_ocr", "image": os.path.basename(path)})
+                except Exception as ocr_err:
+                    log_json({"ok": False, "stage": "azure_ocr_error", "image": os.path.basename(path), "error": str(ocr_err)})
+                    all_ocr_results.append({"text_annotations": [{"description": ""}]})
+
+                all_page_upload_keys.append(ufkey)
+                all_pdf_names.append(pdf_basename)
+
         all_uploaded_images.extend(uploaded)
 
     log_json({
@@ -516,15 +887,113 @@ def main() -> Dict[str, Any]:
         "stage": "pre_mysql_update",
         "ai_case_id": ai_case_id,
         "img_urls_count": len(all_uploaded_images),
+        "ocr_results_count": len(all_ocr_results),
         "mysql_db_env": MYSQL_DB,
     })
 
-    # 画像URLを「|,|」区切りで ai_case.img_urls に保存
+    # img_urls を ai_case に保存
     img_urls_joined = "|,|".join(all_uploaded_images)
+    upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
+    log_json({"ok": upd_ok, "stage": "mysql_update_img_urls", "message": upd_msg})
 
+    # ============================
+    # ページ分類
+    # ============================
+    page_classifications = []
+    for ocr in all_ocr_results:
+        text = ""
+        if isinstance(ocr, dict) and ocr.get("text_annotations"):
+            text = ocr["text_annotations"][0].get("description", "")
+        page_classifications.append(_classify_page(text))
+
+    # ファイルキーごとの PL/BS 数カウント
+    plbs_counts_per_file: Dict[str, Dict[str, int]] = {}
+    for i, cls in enumerate(page_classifications):
+        key = all_page_upload_keys[i] if i < len(all_page_upload_keys) else "unknown"
+        if key not in plbs_counts_per_file:
+            plbs_counts_per_file[key] = {"PL": 0, "BS": 0}
+        if cls["type"] == "PL":
+            plbs_counts_per_file[key]["PL"] += 1
+        elif cls["type"] == "BS":
+            plbs_counts_per_file[key]["BS"] += 1
+
+    # print_images 構築
+    print_images: List[Dict] = []
+    global_subi = 0  # PHP の $subi と同じ：全ページ通し連番
+    for i, path_gs in enumerate(all_uploaded_images):
+        cls = page_classifications[i] if i < len(page_classifications) else {"type": "対象外"}
+        key = all_page_upload_keys[i] if i < len(all_page_upload_keys) else "unknown"
+        global_subi += 1
+        page_info: Dict[str, Any] = {
+            "page_type": dict(cls),
+            "rotation": 0,
+            "images_urls": path_gs,
+            "pdf_names": all_pdf_names[i] if i < len(all_pdf_names) else None,
+            "upload_file_key": key,
+            "page_no": global_subi,
+        }
+        # 対象外以外は "BS or PL" に統一（PHP 準拠）
+        if page_info["page_type"]["type"] != "対象外":
+            page_info["page_type"]["type"] = "BS or PL"
+        print_images.append(page_info)
+
+    # 拡張分類（販売費・製造原価）
+    _apply_extended_classification(print_images, all_ocr_results, READ_SGA, READ_MCR)
+
+    # 最終集計
+    setting: Dict[str, Dict[str, int]] = {}
+    total_seted_all = 0
+    for info in print_images:
+        ufkey = info["upload_file_key"]
+        if ufkey not in setting:
+            setting[ufkey] = {"seted_all": 0, "seted_pl": 0, "seted_bs": 0, "seted_sga": 0, "seted_mfg": 0}
+        ptype = info["page_type"]["type"]
+        if ptype != "対象外":
+            setting[ufkey]["seted_all"] += 1
+            total_seted_all += 1
+        if "PL" in ptype:
+            setting[ufkey]["seted_pl"] += 1
+        if "BS" in ptype:
+            setting[ufkey]["seted_bs"] += 1
+        if "販売費" in ptype:
+            setting[ufkey]["seted_sga"] += 1
+        if "製造原価" in ptype:
+            setting[ufkey]["seted_mfg"] += 1
+
+    log_json({
+        "ok": True,
+        "stage": "classify_done",
+        "total_pages": len(print_images),
+        "total_seted_all": total_seted_all,
+    })
+
+    # ============================
+    # DB から request・page_types を取得して更新
+    # ============================
     post_progress("読取完了まで")
 
-    upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
+    page_types = mysql_fetch_page_types()
+    ai_case_data = mysql_fetch_ai_case_data(ai_case_id=ai_case_id)
+    db_request = ai_case_data.get("request") or {}
+
+    db_request["images"] = print_images
+    db_request["message"] = "アップロードと判定が完了しました"
+    db_request["total_seted_all"] = total_seted_all
+    db_request["set_counts"] = setting
+    db_request["types"] = page_types
+
+    request_json_str = json.dumps(db_request, ensure_ascii=False)
+    sizes_str = "|,|".join(all_image_sizes)
+
+    upd_full_ok, upd_full_msg = mysql_update_ai_case_full(
+        ai_case_id=ai_case_id,
+        request_json=request_json_str,
+        sizes_str=sizes_str,
+        status="IMED",
+    )
+    log_json({"ok": upd_full_ok, "stage": "mysql_update_full", "message": upd_full_msg})
+
+    post_progress("帳票種類識別完了")
 
     result = {
         "ok": True,
@@ -532,7 +1001,9 @@ def main() -> Dict[str, Any]:
         "ai_case_id": ai_case_id,
         "img_urls_delimiter": "|,|",
         "img_urls_count": len(all_uploaded_images),
+        "total_seted_all": total_seted_all,
         "mysql_update": {"ok": upd_ok, "message": upd_msg},
+        "mysql_update_full": {"ok": upd_full_ok, "message": upd_full_msg},
         "images": all_uploaded_images,
     }
 
