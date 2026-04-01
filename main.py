@@ -194,6 +194,7 @@ def post_progress(message: str) -> None:
         "ai_case_id": AI_CASE_ID,
         "f1htbrtxki4x7s4s0xqj": content,
     }).encode("utf-8")
+    log_json({"ok": True, "stage": "post_progress_url", "url": url, "ai_case_id": AI_CASE_ID, "analygent_port": ANALYGENT_PORT})
     for attempt in range(1, 4):  # 最大3回リトライ
         try:
             req = urllib.request.Request(url, data=data)
