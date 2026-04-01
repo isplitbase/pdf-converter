@@ -604,8 +604,8 @@ def _apply_extended_classification(
 
         t = _normalize_classify(raw_text)
         if not t:
-            # PHP 準拠: cur_type に関わらず「不明」をセットして次へ
-            info["page_type"]["type"] = "不明"
+            # PHPでは '不明' → 即座に '対象外' で上書きされるため実質 '対象外'
+            info["page_type"]["type"] = "対象外"
             continue
 
         # 1) 販売費及び一般管理費
