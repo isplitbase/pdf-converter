@@ -7,6 +7,7 @@ import socket
 import urllib.request
 import urllib.parse
 import unicodedata
+import time
 from typing import List, Tuple, Optional, Dict, Any
 
 from google.cloud import storage
@@ -411,7 +412,8 @@ def mysql_probe(
 # =============================
 def call_azure_ocr(image_path: str) -> Dict[str, Any]:
     """
-    Azure Computer Vision OCR API (v3.2) を呼び出す。
+    Azure Form Recognizer (prebuilt-read) を呼び出す。
+    azure_ai.py と同じ API・同じレスポンス形式。
     返り値: {"text_annotations": [{"description": "全テキスト"}]}
     """
     global AZURE_KEY, AZURE_ENDPOINT
@@ -419,13 +421,15 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
         raise RuntimeError("AZURE_KEY または AZURE_ENDPOINT が未設定です")
 
     endpoint = AZURE_ENDPOINT.rstrip("/")
-    url = f"{endpoint}/vision/v3.2/ocr?language=ja&detectOrientation=true"
+    # azure_ai.py と同じエンドポイント
+    ocr_url = f"{endpoint}/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2022-08-31"
 
     with open(image_path, "rb") as f:
         image_data = f.read()
 
+    # Step1: POST → 202 + Operation-Location
     req = urllib.request.Request(
-        url,
+        ocr_url,
         data=image_data,
         headers={
             "Ocp-Apim-Subscription-Key": AZURE_KEY,
@@ -433,17 +437,35 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        operation_url = resp.headers.get("Operation-Location")
 
-    # Azure OCR レスポンス → PHP azure_ai.py 互換形式に変換
-    lines_text = []
-    for region in data.get("regions", []):
-        for line in region.get("lines", []):
-            words = " ".join(w.get("text", "") for w in line.get("words", []))
-            lines_text.append(words)
-    all_text = "\n".join(lines_text)
-    return {"text_annotations": [{"description": all_text}]}
+    if not operation_url:
+        raise RuntimeError("Azure OCR: Operation-Location ヘッダーが取得できませんでした")
+
+    # Step2: ポーリング（azure_ai.py と同じ: 1秒ごと・最大60回）
+    result = {}
+    for _ in range(60):
+        time.sleep(1)
+        poll_req = urllib.request.Request(
+            operation_url,
+            headers={"Ocp-Apim-Subscription-Key": AZURE_KEY},
+        )
+        with urllib.request.urlopen(poll_req, timeout=30) as poll_resp:
+            result = json.loads(poll_resp.read().decode("utf-8"))
+        status = result.get("status")
+        if status == "succeeded":
+            break
+        elif status == "failed":
+            raise RuntimeError("Azure OCR 解析失敗（status=failed）")
+        # "running" / "notStarted" → 続けてポーリング
+    else:
+        raise RuntimeError("Azure OCR タイムアウト（60秒超）")
+
+    # Step3: azure_ai.py と同じ: analyzeResult.content から全テキスト取得
+    azure_text = result["analyzeResult"]["content"]
+
+    return {"text_annotations": [{"description": azure_text}]}
 
 
 # =============================
@@ -871,8 +893,15 @@ def main() -> Dict[str, Any]:
                 img_cont += 1
                 try:
                     ocr_result = call_azure_ocr(path)
+                    azure_text = ocr_result["text_annotations"][0]["description"]
                     all_ocr_results.append(ocr_result)
-                    log_json({"ok": True, "stage": "azure_ocr", "image": os.path.basename(path)})
+                    log_json({
+                        "ok": True,
+                        "stage": "azure_ocr",
+                        "image": os.path.basename(path),
+                        "text_length": len(azure_text),
+                        "text_preview": azure_text[:300],  # 最初の300文字をログ出力
+                    })
                 except Exception as ocr_err:
                     log_json({"ok": False, "stage": "azure_ocr_error", "image": os.path.basename(path), "error": str(ocr_err)})
                     all_ocr_results.append({"text_annotations": [{"description": ""}]})
