@@ -454,24 +454,49 @@ def resize_image_to_canvas(
         return False
 
 
-def generate_gcs_signed_url(blob_obj, expiration_hours: int = 1) -> Optional[str]:
+def generate_gcs_signed_url(blob_obj, expiration_hours: int = 168) -> Optional[str]:
     """
     GCS blob の署名付きURL（v4）を生成する。
+    Cloud Run では service_account_email + access_token 方式で署名する。
     失敗時は None を返す。
     """
     try:
         import google.auth
         import google.auth.transport.requests as _gauth_req
-        credentials, _ = google.auth.default()
-        # Cloud Run ではアクセストークンを明示的にリフレッシュ
-        if not getattr(credentials, "token", None):
-            credentials.refresh(_gauth_req.Request())
-        signed_url = blob_obj.generate_signed_url(
-            expiration=timedelta(hours=expiration_hours),
-            method="GET",
-            version="v4",
-            credentials=credentials,
+
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
+        auth_request = _gauth_req.Request()
+        credentials.refresh(auth_request)
+
+        sa_email = getattr(credentials, "service_account_email", None)
+        token = getattr(credentials, "token", None)
+
+        log_json({
+            "ok": True,
+            "stage": "signed_url_credentials",
+            "sa_email": sa_email,
+            "has_token": bool(token),
+        })
+
+        if sa_email and token:
+            # Cloud Run / GCE: service_account_email + access_token で IAM SignBlob 経由で署名
+            signed_url = blob_obj.generate_signed_url(
+                expiration=timedelta(hours=expiration_hours),
+                method="GET",
+                version="v4",
+                service_account_email=sa_email,
+                access_token=token,
+            )
+        else:
+            # サービスアカウントキーファイル等の場合は credentials を直接渡す
+            signed_url = blob_obj.generate_signed_url(
+                expiration=timedelta(hours=expiration_hours),
+                method="GET",
+                version="v4",
+                credentials=credentials,
+            )
         return signed_url
     except Exception as e:
         log_json({"ok": False, "stage": "generate_signed_url_error", "error": str(e)})
