@@ -187,7 +187,8 @@ def post_progress(message: str) -> None:
     global AI_CASE_ID, ANALYGENT_PORT  # app.py から conv.ANALYGENT_PORT = req.port でセットされる
     if not AI_CASE_ID:
         return
-    url = f"https://corp.analygent.com:{ANALYGENT_PORT}/sapis/set_upload_files_status_bvvu0xwac2afl7ubhkqj.php"
+    # 内部IP経由（HTTP）でアクセス。VPCコネクタ経由のためHTTPで直接接続する
+    url = f"http://10.146.0.2:{ANALYGENT_PORT}/sapis/set_upload_files_status_bvvu0xwac2afl7ubhkqj.php"
     content = json.dumps({"message": message}, ensure_ascii=False)
     data = urllib.parse.urlencode({
         "pqlxf4xct4jdsphk8kgc": "uptprogress",
@@ -543,5 +544,4 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log_json({"ok": False, "error": str(e)})
-        raise
+        log_json({"ok": Fal
