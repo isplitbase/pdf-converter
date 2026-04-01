@@ -517,9 +517,9 @@ def main() -> Dict[str, Any]:
     # 画像URLを「|,|」区切りで ai_case.img_urls に保存
     img_urls_joined = "|,|".join(all_uploaded_images)
 
-    upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
-
     post_progress("読取完了まで")
+
+    upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
 
     result = {
         "ok": True,
