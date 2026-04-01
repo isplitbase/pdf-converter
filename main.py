@@ -194,13 +194,16 @@ def post_progress(message: str) -> None:
         "ai_case_id": AI_CASE_ID,
         "f1htbrtxki4x7s4s0xqj": content,
     }).encode("utf-8")
-    try:
-        req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=5):
-            pass
-        log_json({"ok": True, "stage": "post_progress", "message": message})
-    except Exception as e:
-        log_json({"ok": False, "stage": "post_progress_error", "message": message, "error": str(e)})
+    for attempt in range(1, 4):  # 最大3回リトライ
+        try:
+            req = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            log_json({"ok": True, "stage": "post_progress", "message": message, "attempt": attempt})
+            return
+        except Exception as e:
+            log_json({"ok": False, "stage": "post_progress_error", "message": message, "attempt": attempt, "error": str(e)})
+    log_json({"ok": False, "stage": "post_progress_give_up", "message": message})
 
 
 # =============================
