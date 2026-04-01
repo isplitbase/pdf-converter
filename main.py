@@ -8,6 +8,7 @@ import urllib.request
 import urllib.parse
 import unicodedata
 import time
+from datetime import timedelta
 from typing import List, Tuple, Optional, Dict, Any
 
 from google.cloud import storage
@@ -408,6 +409,76 @@ def mysql_probe(
 
 
 # =============================
+# Image resize (PHP resizeImageToCanvas 移植)
+# =============================
+def resize_image_to_canvas(
+    input_path: str,
+    output_path: str,
+    default_width: int = 2480,
+    default_height: int = 3508,
+) -> bool:
+    """
+    画像をA4キャンバスに収めてリサイズし、JPEGで保存。
+    PHP resizeImageToCanvas() の Python 移植（Pillow使用）。
+    """
+    try:
+        from PIL import Image as _PilImage
+        with _PilImage.open(input_path) as src_img:
+            src_w, src_h = src_img.size
+            # 横向き判定
+            if src_w > src_h:
+                target_w, target_h = default_height, default_width  # 横A4
+            else:
+                target_w, target_h = default_width, default_height  # 縦A4
+            # アスペクト比を保ちながらリサイズ
+            src_ratio = src_w / src_h
+            target_ratio = target_w / target_h
+            if src_ratio > target_ratio:
+                new_w = target_w
+                new_h = int(target_w / src_ratio)
+            else:
+                new_h = target_h
+                new_w = int(target_h * src_ratio)
+            # 白キャンバスに中央貼り付け
+            canvas = _PilImage.new("RGB", (target_w, target_h), (255, 255, 255))
+            resized = src_img.resize((new_w, new_h), _PilImage.LANCZOS)
+            if resized.mode != "RGB":
+                resized = resized.convert("RGB")
+            dst_x = (target_w - new_w) // 2
+            dst_y = (target_h - new_h) // 2
+            canvas.paste(resized, (dst_x, dst_y))
+            canvas.save(output_path, "JPEG", quality=90)
+        return True
+    except Exception as e:
+        log_json({"ok": False, "stage": "resize_image_to_canvas_error", "error": str(e)})
+        return False
+
+
+def generate_gcs_signed_url(blob_obj, expiration_hours: int = 1) -> Optional[str]:
+    """
+    GCS blob の署名付きURL（v4）を生成する。
+    失敗時は None を返す。
+    """
+    try:
+        import google.auth
+        import google.auth.transport.requests as _gauth_req
+        credentials, _ = google.auth.default()
+        # Cloud Run ではアクセストークンを明示的にリフレッシュ
+        if not getattr(credentials, "token", None):
+            credentials.refresh(_gauth_req.Request())
+        signed_url = blob_obj.generate_signed_url(
+            expiration=timedelta(hours=expiration_hours),
+            method="GET",
+            version="v4",
+            credentials=credentials,
+        )
+        return signed_url
+    except Exception as e:
+        log_json({"ok": False, "stage": "generate_signed_url_error", "error": str(e)})
+        return None
+
+
+# =============================
 # Azure OCR
 # =============================
 def call_azure_ocr(image_path: str) -> Dict[str, Any]:
@@ -801,6 +872,7 @@ def main() -> Dict[str, Any]:
         raise ValueError(f"入力ファイルの ai_case_id が一致しません: {ai_case_ids}")
 
     all_uploaded_images: List[str] = []
+    all_signed_urls: List[str] = []           # _mini.jpg の GCS署名付きURL（ページ順）
     all_ocr_results: List[Dict] = []          # Azure OCR 結果（ページ順）
     all_image_sizes: List[str] = []           # "widthxheight"（ページ順）
     all_page_upload_keys: List[str] = []      # upload_file_key（ページ順）
@@ -888,6 +960,28 @@ def main() -> Dict[str, Any]:
                     log_json({"ok": False, "stage": "image_size_error", "path": path, "error": str(size_err)})
                     all_image_sizes.append("unknown")
 
+                # リサイズ → _mini.jpg をGCSアップロード → 署名付きURL生成
+                mini_path = os.path.splitext(path)[0] + "_mini.jpg"
+                mini_obj = f"{out_prefix}{idx}_mini.jpg"
+                signed_url: Optional[str] = None
+                if resize_image_to_canvas(path, mini_path):
+                    try:
+                        mini_blob = bucket_out.blob(mini_obj)
+                        mini_blob.upload_from_filename(mini_path, content_type="image/jpeg")
+                        signed_url = generate_gcs_signed_url(mini_blob, expiration_hours=168)  # 1週間
+                        log_json({
+                            "ok": True,
+                            "stage": "mini_upload",
+                            "gcs": f"gs://{out_bucket}/{mini_obj}",
+                            "signed_url_ok": signed_url is not None,
+                        })
+                    except Exception as mini_err:
+                        log_json({"ok": False, "stage": "mini_upload_error", "error": str(mini_err)})
+                else:
+                    log_json({"ok": False, "stage": "mini_resize_skip", "image": os.path.basename(path)})
+                # 署名付きURL取得失敗時は gs:// URI にフォールバック
+                all_signed_urls.append(signed_url or f"gs://{out_bucket}/{mini_obj}")
+
                 # Azure OCR
                 post_progress(f"{img_cont}番目画像の帳票種類識別中")
                 img_cont += 1
@@ -956,7 +1050,8 @@ def main() -> Dict[str, Any]:
         page_info: Dict[str, Any] = {
             "page_type": dict(cls),
             "rotation": 0,
-            "images_urls": path_gs,
+            # _mini.jpg の署名付きURL（フロントエンド表示用）
+            "images_urls": all_signed_urls[i] if i < len(all_signed_urls) else path_gs,
             "pdf_names": all_pdf_names[i] if i < len(all_pdf_names) else None,
             "upload_file_key": key,
             "page_no": global_subi,
