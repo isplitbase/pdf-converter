@@ -544,4 +544,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log_json({"ok": Fal
+        log_json({"ok": False, "error": str(e)})
+        raise
