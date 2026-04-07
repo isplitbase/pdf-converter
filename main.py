@@ -763,7 +763,7 @@ def _apply_extended_classification(
 # MySQL full update helpers
 # =============================
 def mysql_fetch_ai_case_data(ai_case_id: str) -> Dict[str, Any]:
-    """ai_case から request (dict), upload_file_name (str) を取得"""
+    """ai_case から imgtype_request (dict), upload_file_name (str) を取得"""
     if pymysql is None or not MYSQL_DB:
         return {"request": {}, "upload_file_name": ""}
     try:
@@ -771,7 +771,7 @@ def mysql_fetch_ai_case_data(ai_case_id: str) -> Dict[str, Any]:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT request, upload_file_name FROM `{MYSQL_DB}`.`ai_case` WHERE ai_case_id=%s",
+                    f"SELECT imgtype_request, upload_file_name FROM `{MYSQL_DB}`.`ai_case` WHERE ai_case_id=%s",
                     (ai_case_id,),
                 )
                 row = cur.fetchone()
@@ -814,7 +814,7 @@ def mysql_update_ai_case_full(
     sizes_str: str,
     status: str = "IMED",
 ) -> Tuple[bool, str]:
-    """ai_case の update_at, request, sizes, status を一括更新"""
+    """ai_case の update_at, imgtype_request, sizes, status を一括更新"""
     if not MYSQL_USER:
         return False, "skip_update: MYSQL_USER is empty"
     if pymysql is None:
@@ -836,7 +836,7 @@ def mysql_update_ai_case_full(
                 sql = f"""
                     UPDATE `{db}`.`ai_case`
                     SET update_at=NOW(),
-                        request=%s,
+                        imgtype_request=%s,
                         sizes=%s,
                         status=%s
                     WHERE ai_case_id=%s
