@@ -511,6 +511,12 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
     Azure Form Recognizer (prebuilt-read) を呼び出す。
     azure_ai.py と同じ API・同じレスポンス形式。
     返り値: {"text_annotations": [{"description": "全テキスト"}]}
+
+    タイムアウト方針（2026-05 改修）:
+      - POST(解析リクエスト送信)        : 120 秒
+      - ポーリング(1回ごと)             : 60 秒
+      - ポーリング回数                  : 最大 120 回（≒最大 120 秒）
+      （※実呼び出し側で指数バックオフリトライを行う）
     """
     global AZURE_KEY, AZURE_ENDPOINT
     if not AZURE_KEY or not AZURE_ENDPOINT:
@@ -533,21 +539,21 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         operation_url = resp.headers.get("Operation-Location")
 
     if not operation_url:
         raise RuntimeError("Azure OCR: Operation-Location ヘッダーが取得できませんでした")
 
-    # Step2: ポーリング（azure_ai.py と同じ: 1秒ごと・最大60回）
+    # Step2: ポーリング（1秒ごと・最大 120 回 ≒ 約 120 秒）
     result = {}
-    for _ in range(60):
+    for _ in range(120):
         time.sleep(1)
         poll_req = urllib.request.Request(
             operation_url,
             headers={"Ocp-Apim-Subscription-Key": AZURE_KEY},
         )
-        with urllib.request.urlopen(poll_req, timeout=30) as poll_resp:
+        with urllib.request.urlopen(poll_req, timeout=60) as poll_resp:
             result = json.loads(poll_resp.read().decode("utf-8"))
         status = result.get("status")
         if status == "succeeded":
@@ -556,12 +562,56 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
             raise RuntimeError("Azure OCR 解析失敗（status=failed）")
         # "running" / "notStarted" → 続けてポーリング
     else:
-        raise RuntimeError("Azure OCR タイムアウト（60秒超）")
+        raise RuntimeError("Azure OCR タイムアウト（120秒超）")
 
     # Step3: azure_ai.py と同じ: analyzeResult.content から全テキスト取得
     azure_text = result["analyzeResult"]["content"]
 
     return {"text_annotations": [{"description": azure_text}]}
+
+
+def call_azure_ocr_with_retry(image_path: str, max_attempts: int = 3) -> Dict[str, Any]:
+    """
+    call_azure_ocr() を指数バックオフ付きでリトライするラッパー。
+      - 試行回数: 最大 max_attempts 回（既定 3）
+      - バックオフ待機: 1.5秒 → 3秒 → 6秒（試行間で2倍）
+      - 全試行失敗時は最後の例外を再送出する（呼び出し側で捕捉してデフォルト値を入れる想定）
+    """
+    delays = [1.5, 3.0, 6.0]
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = call_azure_ocr(image_path)
+            if attempt > 1:
+                log_json({
+                    "ok": True,
+                    "stage": "azure_ocr_retry_succeeded",
+                    "image": os.path.basename(image_path),
+                    "attempt": attempt,
+                })
+            return result
+        except Exception as e:
+            last_err = e
+            log_json({
+                "ok": False,
+                "stage": "azure_ocr_attempt_failed",
+                "image": os.path.basename(image_path),
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "error": str(e),
+            })
+            if attempt < max_attempts:
+                wait = delays[min(attempt - 1, len(delays) - 1)]
+                log_json({
+                    "ok": True,
+                    "stage": "azure_ocr_backoff_sleep",
+                    "image": os.path.basename(image_path),
+                    "next_attempt": attempt + 1,
+                    "sleep_seconds": wait,
+                })
+                time.sleep(wait)
+    # 全試行失敗
+    raise last_err if last_err is not None else RuntimeError("Azure OCR: 全リトライ失敗")
 
 
 # =============================
@@ -1027,11 +1077,11 @@ def main() -> Dict[str, Any]:
                 # 署名付きURL取得失敗時は gs:// URI にフォールバック
                 all_signed_urls.append(signed_url or f"gs://{out_bucket}/{mini_obj}")
 
-                # Azure OCR
+                # Azure OCR（指数バックオフリトライ付き）
                 post_progress(f"{img_cont}番目画像の帳票種類識別中")
                 img_cont += 1
                 try:
-                    ocr_result = call_azure_ocr(path)
+                    ocr_result = call_azure_ocr_with_retry(path, max_attempts=3)
                     azure_text = ocr_result["text_annotations"][0]["description"]
                     all_ocr_results.append(ocr_result)
                     log_json({
@@ -1042,8 +1092,19 @@ def main() -> Dict[str, Any]:
                         "text_preview": azure_text[:300],  # 最初の300文字をログ出力
                     })
                 except Exception as ocr_err:
-                    log_json({"ok": False, "stage": "azure_ocr_error", "image": os.path.basename(path), "error": str(ocr_err)})
-                    all_ocr_results.append({"text_annotations": [{"description": ""}]})
+                    # 全リトライ失敗 → 空テキスト + _ocr_failed フラグを付けて記録
+                    # 後段のページ分類で "BS or PL" にデフォルト設定する
+                    log_json({
+                        "ok": False,
+                        "stage": "azure_ocr_error",
+                        "image": os.path.basename(path),
+                        "error": str(ocr_err),
+                        "all_retries_failed": True,
+                    })
+                    all_ocr_results.append({
+                        "text_annotations": [{"description": ""}],
+                        "_ocr_failed": True,
+                    })
 
                 all_page_upload_keys.append(ufkey)
                 all_pdf_names.append(pdf_basename)
@@ -1070,9 +1131,27 @@ def main() -> Dict[str, Any]:
     page_classifications = []
     for ocr in all_ocr_results:
         text = ""
-        if isinstance(ocr, dict) and ocr.get("text_annotations"):
-            text = ocr["text_annotations"][0].get("description", "")
-        page_classifications.append(_classify_page(text))
+        ocr_failed = False
+        if isinstance(ocr, dict):
+            if ocr.get("text_annotations"):
+                text = ocr["text_annotations"][0].get("description", "")
+            ocr_failed = bool(ocr.get("_ocr_failed"))
+        if ocr_failed:
+            # OCR が全リトライ失敗した場合は明示的に "BS or PL" をデフォルトに設定
+            page_classifications.append({
+                "type": "BS or PL",
+                "firstHalfMatch": [],
+                "secondHalfMatch": [],
+                "_ocr_failed_default": True,
+            })
+            log_json({
+                "ok": True,
+                "stage": "classify_default_applied",
+                "default_type": "BS or PL",
+                "reason": "azure_ocr_all_retries_failed",
+            })
+        else:
+            page_classifications.append(_classify_page(text))
 
     # ファイルキーごとの PL/BS 数カウント
     plbs_counts_per_file: Dict[str, Dict[str, int]] = {}
